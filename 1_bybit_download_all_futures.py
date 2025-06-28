@@ -8,23 +8,44 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import websocket
 from collections import defaultdict
+import csv
 
 INTERVALS = ["15"]  # таймфреймы: 1m, 5m, 15m, 1h
 LIMIT = 1000
 SAVE_PATH = "D:/my_emacross_bot/bybit_futures_data_multi_tf/"
 START_TIME = int(time.mktime(time.strptime('2025-05-01 00:00:00', '%Y-%m-%d %H:%M:%S'))) * 1000  # ms, UTC
 
-PAIR_LIMIT = 600  # <---- Лимит пар для парсера (изменяй по необходимости)
+PAIR_LIMIT = 5  # <---- Лимит пар для парсера (изменяй по необходимости)
+
+# Новый параметр: Интервал проверки новых свечей (в секундах)
+NEW_DATA_CHECK_SECONDS = 60 * 10  # <--- Меняй здесь, как часто скрипт будет проверять новые свечи (10 минут)
 
 # --- Глобальный кэш стакана ---
 orderbook_snapshots = defaultdict(list)  # {symbol: [(timestamp, snapshot_dict), ...]}
 orderbook_lock = threading.Lock()
+
+ORDERBOOK_CSV_PATH = os.path.join(SAVE_PATH, "orderbooks")
+os.makedirs(ORDERBOOK_CSV_PATH, exist_ok=True)
 
 def get_symbols():
     url = "https://api.bybit.com/v5/market/tickers?category=linear"
     resp = requests.get(url)
     data = resp.json()
     return [item["symbol"] for item in data["result"]["list"] if "USDT" in item["symbol"]]
+
+def save_orderbook_snapshot(symbol, ts, snapshot):
+    filename = os.path.join(ORDERBOOK_CSV_PATH, f"{symbol}_orderbook.csv")
+    header = not os.path.exists(filename)
+    row = {"timestamp": ts}
+    row.update(snapshot)
+    try:
+        with open(filename, "a", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=row.keys())
+            if header:
+                writer.writeheader()
+            writer.writerow(row)
+    except Exception as e:
+        print(f"[WS] Ошибка записи стакана в файл для {symbol}: {e}")
 
 def orderbook_ws_worker_multi(symbols):
     ws_url = "wss://stream.bybit.com/v5/public/linear"
@@ -61,7 +82,8 @@ def orderbook_ws_worker_multi(symbols):
                     }
                     with orderbook_lock:
                         orderbook_snapshots[symbol].append((ts, snapshot))
-                        print(f"[WS] SNAPSHOT {symbol} {ts}: {snapshot}")  # <--- print добавлен
+                        save_orderbook_snapshot(symbol, ts, snapshot)  # NEW: Save snapshot to file immediately
+                        print(f"[WS] SNAPSHOT {symbol} {ts}: {snapshot}")
                         if len(orderbook_snapshots[symbol]) > 1200:
                             orderbook_snapshots[symbol] = orderbook_snapshots[symbol][-1200:]
         except Exception as e:
@@ -104,7 +126,7 @@ def match_orderbook_to_ohlcv(df, symbol, search_window=30):
     added = {col: [] for col in ob_cols}
     with orderbook_lock:
         ob_snapshots = orderbook_snapshots[symbol][:]
-    print(f"[MATCH] Для пары {symbol} собрано snapshot'ов стакана: {len(ob_snapshots)}")  # <--- print добавлен
+    print(f"[MATCH] Для пары {symbol} собрано snapshot'ов стакана: {len(ob_snapshots)}")
     last_snapshot = {col: None for col in ob_cols}
     for ts in df["timestamp"]:
         nearest = None
@@ -125,6 +147,20 @@ def match_orderbook_to_ohlcv(df, symbol, search_window=30):
     for col in ob_cols:
         df[col] = added[col]
     return df
+
+def append_new_ohlcv_rows(df, full_path):
+    """Дозапись только новых строк OHLCV в файл (по timestamp)"""
+    try:
+        if os.path.exists(full_path):
+            old = pd.read_csv(full_path)
+            existing_timestamps = set(old['timestamp'])
+            df = df[~df['timestamp'].isin(existing_timestamps)]
+            if df.empty:
+                return
+            df = pd.concat([old, df], ignore_index=True).drop_duplicates(subset=['timestamp']).sort_values('timestamp')
+        df.to_csv(full_path, index=False)
+    except Exception as e:
+        print(f"Ошибка при дозаписи файла {full_path}: {e}")
 
 def download_history(symbol, interval, start_time, limit=1000, save_path=SAVE_PATH):
     print(f"Скачиваю {symbol} {interval}m...")
@@ -165,6 +201,24 @@ def download_history(symbol, interval, start_time, limit=1000, save_path=SAVE_PA
     else:
         print(f"Нет данных для {symbol} {interval}m")
 
+def eternal_ohlcv_updater(symbol, interval, save_path, start_time, check_seconds):
+    filename = re.sub(r'[\\/*?:"<>|]', "_", f"{symbol}_{interval}m.csv")
+    full_path = os.path.join(save_path, filename)
+    print(f"[ETERNAL] Запущен вечный режим для {symbol} {interval}m (интервал сканирования новых данных: {check_seconds} сек)")
+    while True:
+        try:
+            df = fetch_ohlcv(symbol, interval, 2)
+            if df is not None and not df.empty:
+                df = df[df["timestamp"] * 1000 >= start_time]
+                # ДОБАВЛЯЕМ сопоставление стакана с новыми свечами!
+                df = match_orderbook_to_ohlcv(df, symbol, search_window=300)
+                append_new_ohlcv_rows(df, full_path)
+                print(f"[ETERNAL] {symbol} {interval}m: добавлено новых строк: {len(df)}")
+        except Exception as e:
+            print(f"[ETERNAL] Ошибка у {symbol} {interval}m: {e}")
+        # Ждём заданное число секунд перед следующей проверкой
+        time.sleep(check_seconds)
+
 def worker(args):
     symbol, interval, start_time, limit, save_path = args
     try:
@@ -196,7 +250,7 @@ if __name__ == "__main__":
         ws_threads.append(t)
         time.sleep(1)
 
-    print("Прогреваем WebSocket 0 секунд перед парсингом свечей для накопления стаканов...")
+    print(f"Прогреваем WebSocket 0 секунд перед парсингом свечей для накопления стаканов...")
     time.sleep(0)
 
     args_list = []
@@ -211,3 +265,20 @@ if __name__ == "__main__":
                 future.result()
             except Exception as e:
                 print(f"Ошибка в потоке: {e}")
+
+    # ---- Вечный цикл для OHLCV ----
+    eternal_threads = []
+    for symbol in symbols:
+        for interval in INTERVALS:
+            t = threading.Thread(
+                target=eternal_ohlcv_updater,
+                args=(symbol, interval, SAVE_PATH, START_TIME, NEW_DATA_CHECK_SECONDS),
+                daemon=True
+            )
+            t.start()
+            eternal_threads.append(t)
+            time.sleep(0.1)
+
+    # Ждём бесконечно, чтобы все потоки жили
+    for t in eternal_threads:
+        t.join()
